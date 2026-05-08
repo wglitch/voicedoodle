@@ -2,19 +2,26 @@
   "use strict";
 
   /*
-    Voice Doodle is intentionally vanilla JS:
-    - Web Audio gives direct microphone analysis and synth playback with low overhead.
-    - DeviceOrientation is read directly so iOS permission can be requested from a tap.
-    - Pitch detection uses a small autocorrelation implementation inspired by pitchy-style
-      time-domain detection. A bundled algorithm keeps the MVP working without CDN/network
-      dependency; swapping to pitchy later only needs replacing detectPitch().
+    Voice Doodle is a material instrument rather than a literal oscilloscope.
+    Audio analysis produces a small set of expressive controls:
+    - pitch: melodic contour, mapped logarithmically so low/high voices both work.
+    - volume: paint pressure, opacity, groove depth and synth gain.
+    - clarity: how stable the detected pitch is; clear whistling makes cleaner marks.
+    - brightness: a time-domain zero-crossing proxy for airy/noisy vocal texture.
+    - pitchDelta: contour motion, used for wobble and oily edge behavior.
+
+    The DeviceOrientation API is still requested from a tap because iOS Safari only
+    allows DeviceOrientationEvent.requestPermission() inside a user gesture. Android
+    Chrome normally starts sending events after the listener is attached on HTTPS.
   */
 
-  const STORAGE_KEY = "voice-doodle.soundprints.v1";
+  const STORAGE_KEY = "voice-doodle.soundprints.v2";
+  const LEGACY_STORAGE_KEY = "voice-doodle.soundprints.v1";
   const MAX_SAVES = 10;
   const FFT_SIZE = 2048;
   const MIN_PITCH = 70;
   const MAX_PITCH = 1200;
+  const SILENCE_RMS = 0.01;
 
   const canvas = document.querySelector("#doodleCanvas");
   const ctx = canvas.getContext("2d", { alpha: true });
@@ -33,9 +40,9 @@
   const closeGalleryButton = document.querySelector("#closeGalleryButton");
 
   const modes = {
-    linear: "Linear",
+    linear: "Score",
     vinyl: "Vinyl",
-    free: "Free"
+    free: "Paint"
   };
 
   const state = {
@@ -48,22 +55,21 @@
     isRecording: false,
     isPlaying: false,
     recordingStartedAt: 0,
-    animationStartedAt: 0,
     records: [],
     playbackFrame: 0,
+    playbackNodes: [],
     livePoint: null,
     lastPitch: 0,
-    lastVolume: 0,
+    lastStablePitch: 220,
+    lastPaint: { x: 0.5, y: 0.5 },
     gyro: { alpha: 0, beta: 0, gamma: 0, supported: false, allowed: false },
     saved: []
   };
 
   function resizeCanvas() {
     const ratio = Math.min(window.devicePixelRatio || 1, 2);
-    const width = Math.floor(window.innerWidth * ratio);
-    const height = Math.floor(window.innerHeight * ratio);
-    canvas.width = width;
-    canvas.height = height;
+    canvas.width = Math.floor(window.innerWidth * ratio);
+    canvas.height = Math.floor(window.innerHeight * ratio);
     canvas.style.width = `${window.innerWidth}px`;
     canvas.style.height = `${window.innerHeight}px`;
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
@@ -83,7 +89,9 @@
 
   function loadSaved() {
     try {
-      const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+      const current = localStorage.getItem(STORAGE_KEY);
+      const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
+      const parsed = JSON.parse(current || legacy || "[]");
       state.saved = Array.isArray(parsed) ? parsed.slice(-MAX_SAVES) : [];
     } catch {
       state.saved = [];
@@ -117,20 +125,20 @@
 
     state.analyser = state.audioContext.createAnalyser();
     state.analyser.fftSize = FFT_SIZE;
-    state.analyser.smoothingTimeConstant = 0.08;
+    state.analyser.smoothingTimeConstant = 0.04;
     state.micSource = state.audioContext.createMediaStreamSource(state.micStream);
     state.micSource.connect(state.analyser);
   }
 
+  async function ensureAudioForPlayback() {
+    const AudioCtor = window.AudioContext || window.webkitAudioContext;
+    state.audioContext = state.audioContext || new AudioCtor({ latencyHint: "interactive" });
+    if (state.audioContext.state === "suspended") {
+      await state.audioContext.resume();
+    }
+  }
+
   async function requestGyro() {
-    /*
-      iOS 13+ exposes DeviceOrientationEvent.requestPermission() and only allows
-      it inside a user gesture. Android Chrome usually skips that method and starts
-      sending events after the listener is attached on HTTPS. The app therefore:
-      1. Attaches the listener.
-      2. Calls requestPermission only when the method exists.
-      3. Treats missing live events as "available but not yet moving" rather than fatal.
-    */
     if (!("DeviceOrientationEvent" in window)) {
       setStatus("Motion sensor missing");
       showToast("No gyro found");
@@ -168,18 +176,58 @@
     if (!state.analyser) return null;
 
     state.analyser.getFloatTimeDomainData(state.sampleBuffer);
-    const volume = getRms(state.sampleBuffer);
-    const pitch = volume > 0.012 ? detectPitch(state.sampleBuffer, state.audioContext.sampleRate) : 0;
-    const cleanPitch = pitch >= MIN_PITCH && pitch <= MAX_PITCH ? smoothPitch(pitch) : 0;
+    const frame = analyzeAudioFrame(state.sampleBuffer, state.audioContext.sampleRate);
+    const time = now - state.recordingStartedAt;
+    const point = buildPoint(time, frame);
 
-    state.lastPitch = cleanPitch || state.lastPitch * 0.92;
-    state.lastVolume = volume;
+    state.livePoint = point;
+    if (point.pitch > 0) {
+      state.lastStablePitch = point.pitch;
+    }
+    return point;
+  }
+
+  function analyzeAudioFrame(buffer, sampleRate) {
+    const volume = getRms(buffer);
+    const brightness = getZeroCrossingRate(buffer);
+    const detection = volume > SILENCE_RMS ? detectPitch(buffer, sampleRate) : { pitch: 0, clarity: 0 };
+    const pitch = detection.pitch >= MIN_PITCH && detection.pitch <= MAX_PITCH && detection.clarity > 0.18
+      ? smoothPitch(detection.pitch, detection.clarity)
+      : 0;
+    const pitchDelta = pitch && state.lastPitch ? clamp((pitch - state.lastPitch) / 180, -1, 1) : 0;
+
+    state.lastPitch = pitch || state.lastPitch * 0.94;
 
     return {
-      time: now - state.recordingStartedAt,
-      pitch: cleanPitch,
+      pitch,
       volume,
-      gyro: { ...state.gyro }
+      clarity: detection.clarity,
+      brightness,
+      pitchDelta
+    };
+  }
+
+  function buildPoint(time, frame) {
+    const pitchForMapping = frame.pitch || state.lastStablePitch;
+    const targetPaint = {
+      x: map(clamp(state.gyro.gamma, -42, 42), -42, 42, 0.08, 0.92),
+      y: map(clamp(state.gyro.beta, -28, 58), -28, 58, 0.12, 0.88)
+    };
+
+    // Gyro is the hand in Paint mode, but smoothing makes it feel like a heavy brush.
+    state.lastPaint.x = mix(state.lastPaint.x || targetPaint.x, targetPaint.x, 0.24);
+    state.lastPaint.y = mix(state.lastPaint.y || targetPaint.y, targetPaint.y, 0.24);
+
+    return {
+      time,
+      pitch: frame.pitch,
+      volume: frame.volume,
+      clarity: frame.clarity,
+      brightness: frame.brightness,
+      pitchDelta: frame.pitchDelta,
+      gyro: { ...state.gyro },
+      paint: { ...state.lastPaint },
+      pitchNorm: pitchToNorm(pitchForMapping)
     };
   }
 
@@ -191,10 +239,21 @@
     return Math.sqrt(sum / buffer.length);
   }
 
-  function smoothPitch(pitch) {
+  function getZeroCrossingRate(buffer) {
+    let crossings = 0;
+    for (let i = 1; i < buffer.length; i += 1) {
+      if ((buffer[i - 1] < 0 && buffer[i] >= 0) || (buffer[i - 1] >= 0 && buffer[i] < 0)) {
+        crossings += 1;
+      }
+    }
+    return clamp(crossings / buffer.length * 18, 0, 1);
+  }
+
+  function smoothPitch(pitch, clarity) {
     if (!state.lastPitch) return pitch;
     const jump = Math.abs(pitch - state.lastPitch);
-    const blend = jump > 160 ? 0.28 : 0.58;
+    const trust = clamp(clarity, 0.18, 0.82);
+    const blend = jump > 170 ? 0.16 : map(trust, 0.18, 0.82, 0.28, 0.62);
     return state.lastPitch * (1 - blend) + pitch * blend;
   }
 
@@ -207,23 +266,30 @@
 
     for (let lag = minLag; lag <= maxLag; lag += 1) {
       let correlation = 0;
+      let energyA = 0;
+      let energyB = 0;
       for (let i = 0; i < size - lag; i += 1) {
-        correlation += buffer[i] * buffer[i + lag];
+        const a = buffer[i];
+        const b = buffer[i + lag];
+        correlation += a * b;
+        energyA += a * a;
+        energyB += b * b;
       }
-      correlation /= size - lag;
-      if (correlation > bestCorrelation) {
-        bestCorrelation = correlation;
+      const normalized = correlation / Math.sqrt((energyA || 1) * (energyB || 1));
+      if (normalized > bestCorrelation) {
+        bestCorrelation = normalized;
         bestLag = lag;
       }
     }
 
-    if (bestLag < 0 || bestCorrelation < 0.004) return 0;
+    if (bestLag < 0 || bestCorrelation < 0.16) return { pitch: 0, clarity: bestCorrelation };
 
     const before = lagCorrelation(buffer, bestLag - 1);
     const center = lagCorrelation(buffer, bestLag);
     const after = lagCorrelation(buffer, bestLag + 1);
     const shift = (after - before) / (2 * (2 * center - before - after));
-    return sampleRate / (bestLag + (Number.isFinite(shift) ? shift : 0));
+    const pitch = sampleRate / (bestLag + (Number.isFinite(shift) ? shift : 0));
+    return { pitch, clarity: clamp(bestCorrelation, 0, 1) };
   }
 
   function lagCorrelation(buffer, lag) {
@@ -238,15 +304,16 @@
   function captureLoop(now) {
     if (state.isRecording) {
       const point = readMicPoint(now);
-      if (point) {
-        state.livePoint = point;
+      if (point && point.volume > SILENCE_RMS * 0.7) {
         state.records.push(point);
       }
     } else if (state.analyser) {
-      state.livePoint = readMicPoint(now);
+      readMicPoint(now);
     }
 
-    drawScene(now);
+    if (!state.isPlaying) {
+      drawScene(now);
+    }
     requestAnimationFrame(captureLoop);
   }
 
@@ -260,12 +327,11 @@
 
     try {
       await ensureAudio();
+      stopPlayback();
       state.records = [];
       state.recordingStartedAt = performance.now();
-      state.animationStartedAt = state.recordingStartedAt;
+      state.lastPitch = 0;
       state.isRecording = true;
-      state.isPlaying = false;
-      stopPlayback();
       document.body.classList.add("is-recording");
       setStatus("Recording");
     } catch (error) {
@@ -280,78 +346,85 @@
     state.isRecording = false;
     document.body.classList.remove("is-recording");
     state.isPlaying = true;
-    state.playbackAudioStartedAt = scheduleSynth(state.records);
+    state.playbackAudioStartedAt = scheduleContinuousSynth(state.records);
     state.playbackFrame = requestAnimationFrame(drawPlayback);
     setStatus("Playing");
   }
 
-  async function ensureAudioForPlayback() {
-    const AudioCtor = window.AudioContext || window.webkitAudioContext;
-    state.audioContext = state.audioContext || new AudioCtor({ latencyHint: "interactive" });
-    if (state.audioContext.state === "suspended") {
-      await state.audioContext.resume();
-    }
-  }
-
-  function scheduleSynth(points) {
+  function scheduleContinuousSynth(points) {
     /*
-      Playback uses generated sound, not recorded audio. Each pitch point drives a
-      triangle oscillator through a soft gain envelope. AudioContext.currentTime is
-      the master clock; the canvas reads the same elapsed time, so visual playback
-      stays locked to the synth sequence instead of drifting with setTimeout.
+      Playback is now one continuous synth voice. Frequency, gain and filter values
+      ramp through the recorded data, which avoids the choppy stack of many short
+      oscillators and keeps the generated sound synced to the visual replay.
     */
-    stopPlayback.nodes = [];
-    const now = state.audioContext.currentTime + 0.035;
+    stopPlayback();
+    state.isPlaying = true;
+
+    const audio = state.audioContext;
+    const start = audio.currentTime + 0.04;
+    const endMs = last(points)?.time || 0;
+    const osc = audio.createOscillator();
+    const gain = audio.createGain();
+    const filter = audio.createBiquadFilter();
+    const delay = audio.createDelay(0.24);
+    const delayGain = audio.createGain();
+
+    osc.type = "sine";
+    filter.type = "lowpass";
+    gain.gain.setValueAtTime(0.0001, start);
+    filter.frequency.setValueAtTime(1800, start);
+    delay.delayTime.setValueAtTime(0.12, start);
+    delayGain.gain.setValueAtTime(0.08, start);
+
     const usable = points.filter((point) => point.pitch > 0);
+    if (!usable.length) return start;
 
+    osc.frequency.setValueAtTime(clamp(usable[0].pitch, MIN_PITCH, MAX_PITCH), start);
     usable.forEach((point, index) => {
-      const next = usable[index + 1];
-      const start = now + point.time / 1000;
-      const duration = Math.max(0.035, Math.min(0.14, ((next?.time ?? point.time + 80) - point.time) / 1000));
-      const osc = state.audioContext.createOscillator();
-      const gain = state.audioContext.createGain();
-      const filter = state.audioContext.createBiquadFilter();
-
-      osc.type = "triangle";
-      osc.frequency.setValueAtTime(clamp(point.pitch, MIN_PITCH, MAX_PITCH), start);
-      filter.type = "lowpass";
-      filter.frequency.setValueAtTime(1600 + clamp(point.volume * 9000, 0, 5200), start);
-      gain.gain.setValueAtTime(0.0001, start);
-      gain.gain.exponentialRampToValueAtTime(clamp(point.volume * 1.8, 0.015, 0.18), start + 0.012);
-      gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
-
-      osc.connect(filter);
-      filter.connect(gain);
-      gain.connect(state.audioContext.destination);
-      osc.start(start);
-      osc.stop(start + duration + 0.03);
-      stopPlayback.nodes.push(osc, gain, filter);
+      if (index % 2 !== 0 && usable.length > 120) return;
+      const when = start + point.time / 1000;
+      const pitch = clamp(point.pitch, MIN_PITCH, MAX_PITCH);
+      const amp = clamp(point.volume * 2.2, 0.0001, 0.22);
+      const cutoff = 900 + point.brightness * 2800 + point.clarity * 1400;
+      osc.frequency.linearRampToValueAtTime(pitch, when);
+      gain.gain.linearRampToValueAtTime(amp, when);
+      filter.frequency.linearRampToValueAtTime(cutoff, when);
     });
 
-    return now;
+    gain.gain.linearRampToValueAtTime(0.0001, start + endMs / 1000 + 0.18);
+    osc.connect(filter);
+    filter.connect(gain);
+    gain.connect(audio.destination);
+    gain.connect(delay);
+    delay.connect(delayGain);
+    delayGain.connect(audio.destination);
+    osc.start(start);
+    osc.stop(start + endMs / 1000 + 0.26);
+    state.playbackNodes = [osc, gain, filter, delay, delayGain];
+    return start;
   }
 
   function stopPlayback() {
     if (state.playbackFrame) cancelAnimationFrame(state.playbackFrame);
     state.playbackFrame = 0;
     state.isPlaying = false;
-    (stopPlayback.nodes || []).forEach((node) => {
+    state.playbackNodes.forEach((node) => {
       try {
         if (typeof node.stop === "function") node.stop();
         if (typeof node.disconnect === "function") node.disconnect();
       } catch {
-        // Nodes may already be stopped; disconnecting best-effort is enough.
+        // Audio nodes can already be stopped by their scheduled end time.
       }
     });
-    stopPlayback.nodes = [];
+    state.playbackNodes = [];
   }
 
   function drawPlayback(now) {
     if (!state.isPlaying) return;
     const elapsed = (state.audioContext.currentTime - state.playbackAudioStartedAt) * 1000;
-    const endTime = state.records.at(-1)?.time ?? 0;
+    const endTime = last(state.records)?.time ?? 0;
     drawScene(now, Math.max(0, elapsed));
-    if (elapsed <= endTime + 180) {
+    if (elapsed <= endTime + 220) {
       state.playbackFrame = requestAnimationFrame(drawPlayback);
     } else {
       stopPlayback();
@@ -364,161 +437,360 @@
     const width = window.innerWidth;
     const height = window.innerHeight;
     ctx.clearRect(0, 0, width, height);
-    drawBackdrop(width, height);
+    drawMaterialBackground(width, height, now);
 
     const points = playbackTime === null
       ? state.records
       : state.records.filter((point) => point.time <= playbackTime);
 
     if (points.length > 1) {
-      if (state.mode === "linear") drawLinear(points, width, height);
-      if (state.mode === "vinyl") drawVinyl(points, width, height, now);
-      if (state.mode === "free") drawFree(points, width, height);
+      if (state.mode === "linear") renderScore(points, width, height);
+      if (state.mode === "vinyl") renderVinyl(points, width, height, now, playbackTime);
+      if (state.mode === "free") renderPaint(points, width, height);
+    } else if (!state.records.length && state.livePoint) {
+      drawLiveProbe(state.livePoint, width, height, now);
     }
 
-    if (!state.records.length && state.livePoint) {
-      drawLiveProbe(state.livePoint, width, height, now);
+    drawMaterialOverlay(width, height);
+  }
+
+  function drawMaterialBackground(width, height, now) {
+    if (state.mode === "free") {
+      drawLinen(width, height);
+    } else if (state.mode === "linear") {
+      drawPaper(width, height);
+    } else {
+      drawVinylSurface(width, height, now);
     }
   }
 
-  function drawBackdrop(width, height) {
+  function drawLinen(width, height) {
     const gradient = ctx.createLinearGradient(0, 0, width, height);
-    gradient.addColorStop(0, "#050817");
-    gradient.addColorStop(0.5, "#11194a");
-    gradient.addColorStop(1, "#2a144d");
+    gradient.addColorStop(0, "#d8c29d");
+    gradient.addColorStop(0.5, "#b99a70");
+    gradient.addColorStop(1, "#876845");
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, width, height);
 
-    ctx.globalAlpha = 0.16;
-    ctx.strokeStyle = "#ffffff";
+    ctx.globalAlpha = 0.12;
+    ctx.strokeStyle = "#fff7df";
     ctx.lineWidth = 1;
-    for (let y = height * 0.18; y < height; y += 46) {
+    for (let x = 0; x < width; x += 8) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x + Math.sin(x) * 1.5, height);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = "#5b452d";
+    for (let y = 0; y < height; y += 9) {
       ctx.beginPath();
       ctx.moveTo(0, y);
-      ctx.lineTo(width, y + Math.sin(y * 0.02) * 18);
+      ctx.lineTo(width, y + Math.cos(y) * 1.5);
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
   }
 
-  function drawLinear(points, width, height) {
-    const latest = points.at(-1).time;
-    const windowMs = 9000;
-    const start = Math.max(0, latest - windowMs);
-    const visible = points.filter((point) => point.time >= start && point.pitch > 0);
-    drawSmoothPath(visible, (point) => {
-      const x = map(point.time, start, start + windowMs, width * 0.06, width * 0.94);
-      const y = pitchToY(point.pitch, height);
-      return { x, y, size: volumeToLine(point.volume), color: pointColor(point) };
-    });
+  function drawPaper(width, height) {
+    ctx.fillStyle = "#f2ead7";
+    ctx.fillRect(0, 0, width, height);
+
+    ctx.globalAlpha = 0.22;
+    ctx.strokeStyle = "#b9c9cc";
+    ctx.lineWidth = 1;
+    for (let y = height * 0.18; y < height * 0.86; y += height * 0.105) {
+      ctx.beginPath();
+      ctx.moveTo(width * 0.06, y);
+      ctx.bezierCurveTo(width * 0.32, y - 3, width * 0.66, y + 3, width * 0.94, y);
+      ctx.stroke();
+    }
+
+    ctx.globalAlpha = 0.08;
+    for (let i = 0; i < 90; i += 1) {
+      const x = seededNoise(i * 12.989) * width;
+      const y = seededNoise(i * 78.233) * height;
+      ctx.fillStyle = i % 2 ? "#384b55" : "#ffffff";
+      ctx.fillRect(x, y, 1.2, 1.2);
+    }
+    ctx.globalAlpha = 1;
   }
 
-  function drawVinyl(points, width, height, now) {
+  function drawVinylSurface(width, height, now) {
     const cx = width / 2;
     const cy = height / 2;
-    const maxRadius = Math.min(width, height) * 0.42;
-    const spin = now * 0.00022;
-    const duration = Math.max(1000, points.at(-1).time);
+    const radius = Math.min(width, height) * 0.49;
+    const gradient = ctx.createRadialGradient(cx - radius * 0.2, cy - radius * 0.24, radius * 0.04, cx, cy, radius);
+    gradient.addColorStop(0, "#3d3d3a");
+    gradient.addColorStop(0.34, "#171716");
+    gradient.addColorStop(0.72, "#070707");
+    gradient.addColorStop(1, "#000000");
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, width, height);
 
-    ctx.globalAlpha = 0.24;
-    ctx.strokeStyle = "#ffffff";
-    for (let r = maxRadius * 0.24; r <= maxRadius; r += maxRadius * 0.18) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(now * 0.00008);
+    ctx.globalAlpha = 0.32;
+    for (let r = radius * 0.2; r < radius * 0.96; r += 7) {
+      ctx.strokeStyle = r % 21 < 7 ? "#262626" : "#111";
+      ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    ctx.globalAlpha = 0.42;
+    ctx.strokeStyle = "#d0b46b";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius * 0.12, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawMaterialOverlay(width, height) {
+    if (state.mode !== "vinyl") {
+      ctx.globalAlpha = state.mode === "free" ? 0.08 : 0.06;
+      ctx.fillStyle = "#2f2519";
+      for (let i = 0; i < 70; i += 1) {
+        const x = seededNoise(i * 9.17) * width;
+        const y = seededNoise(i * 4.67) * height;
+        ctx.fillRect(x, y, 1, state.mode === "free" ? 5 : 2);
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function renderPaint(points, width, height) {
+    const active = points.filter((point) => point.volume > SILENCE_RMS && point.pitchNorm >= 0);
+    if (active.length < 2) return;
+
+    ctx.save();
+    ctx.globalCompositeOperation = "source-over";
+    drawOilyStroke(active, width, height);
+    ctx.restore();
+  }
+
+  function drawOilyStroke(points, width, height) {
+    for (let layer = 0; layer < 4; layer += 1) {
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.globalAlpha = [0.24, 0.38, 0.64, 0.26][layer];
+
+      for (let i = 1; i < points.length; i += 1) {
+        const a = paintProject(points[i - 1], width, height, layer);
+        const b = paintProject(points[i], width, height, layer);
+        const wobble = (points[i].brightness + Math.abs(points[i].pitchDelta)) * (layer + 1) * 2.4;
+        const cx = (a.x + b.x) / 2 + Math.sin(i * 1.7 + layer) * wobble;
+        const cy = (a.y + b.y) / 2 + Math.cos(i * 1.3 + layer) * wobble;
+        const gradient = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+        gradient.addColorStop(0, paintColor(points[i - 1], layer));
+        gradient.addColorStop(1, paintColor(points[i], layer));
+        ctx.strokeStyle = gradient;
+        ctx.lineWidth = Math.max(1, paintSize(points[i]) * [1.55, 1.1, 0.7, 0.22][layer]);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.quadraticCurveTo(cx, cy, b.x, b.y);
+        ctx.stroke();
+      }
+    }
+
+    ctx.globalAlpha = 0.33;
+    ctx.strokeStyle = "#fff3d2";
+    ctx.lineWidth = 1.2;
+    for (let i = 4; i < points.length; i += 7) {
+      const p = paintProject(points[i], width, height, 0);
+      const angle = normalizeAngle(points[i].gyro.alpha) * Math.PI / 180;
+      const len = 5 + points[i].volume * 70;
+      ctx.beginPath();
+      ctx.moveTo(p.x - Math.cos(angle) * len * 0.5, p.y - Math.sin(angle) * len * 0.5);
+      ctx.lineTo(p.x + Math.cos(angle) * len * 0.5, p.y + Math.sin(angle) * len * 0.5);
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
-
-    drawSmoothPath(points.filter((point) => point.pitch > 0), (point) => {
-      const radius = mapPitch(point.pitch, maxRadius * 0.16, maxRadius);
-      const angle = map(point.time, 0, duration, -Math.PI / 2, Math.PI * 5.5) + spin;
-      return {
-        x: cx + Math.cos(angle) * radius,
-        y: cy + Math.sin(angle) * radius,
-        size: volumeToLine(point.volume),
-        color: pointColor(point)
-      };
-    });
   }
 
-  function drawFree(points, width, height) {
-    drawSmoothPath(points.filter((point) => point.pitch > 0), (point) => {
-      const x = map(clamp(point.gyro.gamma, -45, 45), -45, 45, width * 0.08, width * 0.92);
-      const y = pitchToY(point.pitch, height);
-      return { x, y, size: volumeToLine(point.volume), color: pointColor(point) };
-    });
+  function renderScore(points, width, height) {
+    const active = points.filter((point) => point.pitch > 0);
+    if (active.length < 2) return;
+
+    ctx.save();
+    ctx.globalCompositeOperation = "multiply";
+    for (let pass = 0; pass < 4; pass += 1) {
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.globalAlpha = [0.12, 0.18, 0.34, 0.16][pass];
+      for (let i = 1; i < active.length; i += 1) {
+        const a = scoreProject(active[i - 1], width, height, pass);
+        const b = scoreProject(active[i], width, height, pass);
+        const midY = (a.y + b.y) / 2 + Math.sin(i * 0.8 + pass) * (2 + active[i].brightness * 8);
+        ctx.strokeStyle = scoreColor(active[i], pass);
+        ctx.lineWidth = scoreSize(active[i]) * [2.8, 1.7, 0.9, 3.8][pass];
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.quadraticCurveTo((a.x + b.x) / 2, midY, b.x, b.y);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
   }
 
-  function drawSmoothPath(points, project) {
-    if (points.length < 2) return;
+  function renderVinyl(points, width, height, now, playbackTime) {
+    const active = points.filter((point) => point.pitch > 0);
+    if (active.length < 2) return;
 
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
+    const cx = width / 2;
+    const cy = height / 2;
+    const maxRadius = Math.min(width, height) * 0.43;
+    const duration = Math.max(1000, last(points).time);
+    const spin = now * 0.00016;
 
-    for (let i = 1; i < points.length; i += 1) {
-      const prev = project(points[i - 1]);
-      const current = project(points[i]);
-      const midX = (prev.x + current.x) / 2;
-      const midY = (prev.y + current.y) / 2;
-      const gradient = ctx.createLinearGradient(prev.x, prev.y, current.x, current.y);
-      gradient.addColorStop(0, prev.color);
-      gradient.addColorStop(1, current.color);
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(spin);
+    ctx.translate(-cx, -cy);
 
-      ctx.strokeStyle = gradient;
-      ctx.lineWidth = current.size;
-      ctx.globalAlpha = 0.86;
+    for (let i = 1; i < active.length; i += 1) {
+      const a = vinylProject(active[i - 1], cx, cy, maxRadius, duration);
+      const b = vinylProject(active[i], cx, cy, maxRadius, duration);
+      const depth = vinylSize(active[i]);
+
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.globalAlpha = 0.85;
+      ctx.strokeStyle = "#020202";
+      ctx.lineWidth = depth + 3;
       ctx.beginPath();
-      ctx.moveTo(prev.x, prev.y);
-      ctx.quadraticCurveTo(prev.x, prev.y, midX, midY);
+      ctx.moveTo(a.x + 1.5, a.y + 1.5);
+      ctx.lineTo(b.x + 1.5, b.y + 1.5);
+      ctx.stroke();
+
+      ctx.globalAlpha = 0.75;
+      ctx.strokeStyle = vinylColor(active[i]);
+      ctx.lineWidth = Math.max(1, depth * 0.58);
+      ctx.beginPath();
+      ctx.moveTo(a.x - 1, a.y - 1);
+      ctx.lineTo(b.x - 1, b.y - 1);
       ctx.stroke();
     }
+    ctx.restore();
 
-    const last = project(points.at(-1));
-    ctx.globalAlpha = 0.9;
-    ctx.fillStyle = last.color;
+    if (state.isPlaying && playbackTime !== null) {
+      drawVinylNeedle(width, height, now);
+    }
+  }
+
+  function paintProject(point, width, height, layer) {
+    const jitter = (point.brightness + Math.abs(point.pitchDelta)) * (layer + 1) * 3.6;
+    return {
+      x: point.paint.x * width + Math.sin(point.time * 0.015 + layer) * jitter,
+      y: point.paint.y * height + Math.cos(point.time * 0.012 + layer) * jitter
+    };
+  }
+
+  function scoreProject(point, width, height, pass) {
+    const latest = last(state.records)?.time || point.time || 1;
+    const start = Math.max(0, latest - 9500);
+    const x = map(point.time, start, start + 9500, width * 0.06, width * 0.94);
+    const drift = map(clamp(point.gyro.gamma, -45, 45), -45, 45, -14, 14);
+    const bleed = Math.sin(point.time * 0.006 + pass * 1.9) * (pass + 1) * (1 + point.brightness * 5);
+    return {
+      x,
+      y: map(point.pitchNorm, 0, 1, height * 0.82, height * 0.18) + drift * 0.2 + bleed
+    };
+  }
+
+  function vinylProject(point, cx, cy, maxRadius, duration) {
+    const radius = map(point.pitchNorm, 0, 1, maxRadius * 0.18, maxRadius);
+    const angle = map(point.time, 0, duration, -Math.PI / 2, Math.PI * 5.75);
+    const modulation = Math.sin(point.time * 0.028) * point.brightness * 5;
+    return {
+      x: cx + Math.cos(angle) * (radius + modulation),
+      y: cy + Math.sin(angle) * (radius + modulation)
+    };
+  }
+
+  function drawVinylNeedle(width, height, now) {
+    const cx = width / 2;
+    const cy = height / 2;
+    const radius = Math.min(width, height) * 0.36;
+    const angle = -Math.PI / 5 + Math.sin(now * 0.001) * 0.02;
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = "#b8b0a2";
+    ctx.lineWidth = 3;
     ctx.beginPath();
-    ctx.arc(last.x, last.y, Math.max(5, last.size * 1.15), 0, Math.PI * 2);
+    ctx.moveTo(width * 0.82, height * 0.18);
+    ctx.lineTo(cx + Math.cos(angle) * radius, cy + Math.sin(angle) * radius);
+    ctx.stroke();
+    ctx.fillStyle = "#d6bd77";
+    ctx.beginPath();
+    ctx.arc(cx + Math.cos(angle) * radius, cy + Math.sin(angle) * radius, 4, 0, Math.PI * 2);
     ctx.fill();
     ctx.globalAlpha = 1;
   }
 
   function drawLiveProbe(point, width, height, now) {
-    const pulse = 10 + Math.sin(now * 0.008) * 4 + point.volume * 180;
-    const x = state.mode === "free"
-      ? map(clamp(point.gyro.gamma, -45, 45), -45, 45, width * 0.08, width * 0.92)
-      : width / 2;
-    const y = point.pitch ? pitchToY(point.pitch, height) : height / 2;
-    ctx.fillStyle = pointColor(point);
-    ctx.globalAlpha = 0.72;
+    const size = 10 + point.volume * 170;
+    let x = width / 2;
+    let y = height / 2;
+    if (state.mode === "free") {
+      x = point.paint.x * width;
+      y = point.paint.y * height;
+    } else if (state.mode === "linear" && point.pitch > 0) {
+      y = map(point.pitchNorm, 0, 1, height * 0.82, height * 0.18);
+    }
+
+    ctx.fillStyle = state.mode === "vinyl" ? "#d6bd77" : materialColor(point, 0);
+    ctx.globalAlpha = 0.46 + point.volume * 2;
     ctx.beginPath();
-    ctx.arc(x, y, pulse, 0, Math.PI * 2);
+    ctx.arc(x, y, size + Math.sin(now * 0.008) * 4, 0, Math.PI * 2);
     ctx.fill();
     ctx.globalAlpha = 1;
   }
 
-  function pointColor(point) {
-    const tiltHue = state.mode === "free"
-      ? map(normalizeAngle(point.gyro.alpha), 0, 360, 285, 55)
-      : map(clamp(point.gyro.gamma + point.gyro.beta * 0.28, -70, 70), -70, 70, 220, 330);
-    const loud = clamp(point.volume * 18, 0, 1);
-    const hue = mix(tiltHue, 48, loud * 0.42);
-    const saturation = 78 + loud * 20;
-    const lightness = 54 + loud * 14;
-    return `hsl(${hue} ${saturation}% ${lightness}%)`;
+  function paintSize(point) {
+    return clamp(8 + point.volume * 180 + point.clarity * 7, 5, 34);
   }
 
-  function volumeToLine(volume) {
-    return clamp(1.4 + volume * 130, 1.4, 18);
+  function scoreSize(point) {
+    return clamp(1.2 + point.volume * 84, 1.2, 13);
   }
 
-  function pitchToY(pitch, height) {
-    return mapPitch(pitch, height * 0.82, height * 0.18);
+  function vinylSize(point) {
+    return clamp(1.4 + point.volume * 92 + point.clarity * 2, 1.4, 13);
   }
 
-  function mapPitch(pitch, outMin, outMax) {
+  function paintColor(point, layer) {
+    const hue = mix(214, 44, point.pitchNorm);
+    const oilShift = map(clamp(point.gyro.alpha, 0, 360), 0, 360, -22, 22);
+    const sat = 62 + point.clarity * 28 - layer * 4;
+    const light = 34 + point.volume * 34 + layer * 4;
+    return `hsl(${hue + oilShift} ${sat}% ${light}%)`;
+  }
+
+  function scoreColor(point, pass) {
+    const hue = mix(194, 328, point.pitchNorm);
+    const warm = point.volume * 28;
+    return `hsl(${hue + warm} ${54 + point.clarity * 24}% ${58 + pass * 5}%)`;
+  }
+
+  function vinylColor(point) {
+    const hue = mix(205, 42, point.pitchNorm);
+    const light = 46 + point.volume * 36 + point.clarity * 10;
+    return `hsl(${hue} 28% ${light}%)`;
+  }
+
+  function materialColor(point, layer) {
+    if (state.mode === "free") return paintColor(point, layer);
+    if (state.mode === "vinyl") return vinylColor(point);
+    return scoreColor(point, layer);
+  }
+
+  function pitchToNorm(pitch) {
     const logMin = Math.log2(MIN_PITCH);
     const logMax = Math.log2(MAX_PITCH);
-    return map(clamp(Math.log2(pitch || MIN_PITCH), logMin, logMax), logMin, logMax, outMin, outMax);
+    return clamp((Math.log2(pitch || MIN_PITCH) - logMin) / (logMax - logMin), 0, 1);
   }
 
   function map(value, inMin, inMax, outMin, outMax) {
@@ -538,6 +810,15 @@
     return ((value % 360) + 360) % 360;
   }
 
+  function last(items) {
+    return items[items.length - 1];
+  }
+
+  function seededNoise(seed) {
+    const x = Math.sin(seed) * 10000;
+    return x - Math.floor(x);
+  }
+
   function clearSoundprint() {
     stopPlayback();
     state.records = [];
@@ -548,6 +829,7 @@
 
   function switchMode(mode) {
     state.mode = mode;
+    document.body.dataset.mode = mode;
     modeLabel.textContent = modes[mode];
     modeButtons.forEach((button) => button.classList.toggle("is-active", button.dataset.mode === mode));
     drawScene(performance.now());
@@ -562,16 +844,7 @@
     const item = {
       id: crypto.randomUUID?.() || String(Date.now()),
       mode: state.mode,
-      points: state.records.map((point) => ({
-        time: Math.round(point.time),
-        pitch: Math.round(point.pitch * 10) / 10,
-        volume: Math.round(point.volume * 10000) / 10000,
-        gyro: {
-          alpha: Math.round(point.gyro.alpha * 10) / 10,
-          beta: Math.round(point.gyro.beta * 10) / 10,
-          gamma: Math.round(point.gyro.gamma * 10) / 10
-        }
-      })),
+      points: state.records.map(serializePoint),
       timestamp: Date.now(),
       thumbnail: makeThumbnail()
     };
@@ -581,6 +854,31 @@
     persistSaved();
     showToast("Soundprint saved");
     renderGallery();
+  }
+
+  function serializePoint(point) {
+    return {
+      time: Math.round(point.time),
+      pitch: round(point.pitch, 10),
+      volume: round(point.volume, 10000),
+      clarity: round(point.clarity ?? 0, 1000),
+      brightness: round(point.brightness ?? 0, 1000),
+      pitchDelta: round(point.pitchDelta ?? 0, 1000),
+      pitchNorm: round(point.pitchNorm ?? pitchToNorm(point.pitch), 1000),
+      gyro: {
+        alpha: round(point.gyro?.alpha ?? 0, 10),
+        beta: round(point.gyro?.beta ?? 0, 10),
+        gamma: round(point.gyro?.gamma ?? 0, 10)
+      },
+      paint: {
+        x: round(point.paint?.x ?? 0.5, 1000),
+        y: round(point.paint?.y ?? 0.5, 1000)
+      }
+    };
+  }
+
+  function round(value, factor) {
+    return Math.round(value * factor) / factor;
   }
 
   function makeThumbnail() {
@@ -650,13 +948,25 @@
 
   function loadSoundprint(item) {
     stopPlayback();
-    state.records = item.points.map((point) => ({
-      ...point,
-      gyro: point.gyro || { alpha: 0, beta: 0, gamma: 0 }
-    }));
+    state.records = item.points.map(normalizeLoadedPoint);
     switchMode(item.mode in modes ? item.mode : "linear");
     setStatus("Soundprint loaded");
     drawScene(performance.now());
+  }
+
+  function normalizeLoadedPoint(point) {
+    const pitchNorm = point.pitchNorm ?? pitchToNorm(point.pitch || state.lastStablePitch);
+    return {
+      time: point.time ?? 0,
+      pitch: point.pitch ?? 0,
+      volume: point.volume ?? 0,
+      clarity: point.clarity ?? 0.5,
+      brightness: point.brightness ?? 0.2,
+      pitchDelta: point.pitchDelta ?? 0,
+      gyro: point.gyro || { alpha: 0, beta: 0, gamma: 0 },
+      paint: point.paint || { x: 0.5, y: map(pitchNorm, 0, 1, 0.82, 0.18) },
+      pitchNorm
+    };
   }
 
   function updateButtonStates() {
@@ -689,6 +999,7 @@
   window.addEventListener("orientationchange", resizeCanvas);
 
   loadSaved();
+  switchMode("linear");
   resizeCanvas();
   warnIfInsecure();
   requestAnimationFrame(captureLoop);

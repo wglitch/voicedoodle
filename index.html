@@ -3,34 +3,34 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <meta name="theme-color" content="#0b1028">
+    <meta name="theme-color" content="#17110c">
     <title>Voice Doodle</title>
     <link rel="stylesheet" href="styles.css">
   </head>
-  <body>
+  <body data-mode="linear">
     <main class="app-shell" aria-label="Voice Doodle instrument">
       <canvas id="doodleCanvas" aria-label="Soundprint canvas"></canvas>
 
       <section class="top-bar" aria-label="Status and mode">
         <div class="brand-mark" aria-hidden="true">VD</div>
         <div class="status-stack">
-          <p id="modeLabel" class="mode-label">Linear</p>
+          <p id="modeLabel" class="mode-label">Score</p>
           <p id="statusText" class="status-text">Ready</p>
         </div>
         <button id="gyroButton" class="icon-button permission-button" type="button" aria-label="Enable motion">
-          <span aria-hidden="true">~</span>
+          <span aria-hidden="true">tilt</span>
         </button>
       </section>
 
       <section class="mode-switcher" aria-label="Visualization mode">
-        <button class="mode-button is-active" type="button" data-mode="linear" aria-label="Linear mode">
-          <span aria-hidden="true">/</span>
+        <button class="mode-button is-active" type="button" data-mode="linear" aria-label="Score mode">
+          <span aria-hidden="true">S</span>
         </button>
         <button class="mode-button" type="button" data-mode="vinyl" aria-label="Vinyl mode">
-          <span aria-hidden="true">O</span>
+          <span aria-hidden="true">V</span>
         </button>
-        <button class="mode-button" type="button" data-mode="free" aria-label="Free mode">
-          <span aria-hidden="true">*</span>
+        <button class="mode-button" type="button" data-mode="free" aria-label="Paint mode">
+          <span aria-hidden="true">P</span>
         </button>
       </section>
 
@@ -39,16 +39,16 @@
           <span class="record-dot" aria-hidden="true"></span>
         </button>
         <button id="playButton" class="main-action" type="button" aria-label="Play">
-          <span aria-hidden="true">></span>
+          <span aria-hidden="true">play</span>
         </button>
         <button id="saveButton" class="main-action" type="button" aria-label="Save soundprint">
-          <span aria-hidden="true">+</span>
+          <span aria-hidden="true">save</span>
         </button>
         <button id="galleryButton" class="main-action" type="button" aria-label="Open gallery">
-          <span aria-hidden="true">#</span>
+          <span aria-hidden="true">grid</span>
         </button>
         <button id="clearButton" class="main-action" type="button" aria-label="Clear">
-          <span aria-hidden="true">x</span>
+          <span aria-hidden="true">clear</span>
         </button>
       </section>
 
