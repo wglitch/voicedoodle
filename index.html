@@ -11,57 +11,51 @@
     <main class="app-shell" aria-label="Voice Doodle instrument">
       <canvas id="doodleCanvas" aria-label="Soundprint canvas"></canvas>
 
-      <section class="top-bar" aria-label="Status and mode">
-        <div class="brand-mark" aria-hidden="true">VD</div>
-        <div class="status-stack">
-          <p id="modeLabel" class="mode-label">Score</p>
-          <p id="statusText" class="status-text">Ready</p>
-        </div>
-        <button id="gyroButton" class="icon-button permission-button" type="button" aria-label="Enable motion">
-          <span aria-hidden="true">tilt</span>
-        </button>
-      </section>
-
-      <section class="mode-switcher" aria-label="Visualization mode">
+      <section class="top-bar" aria-label="Voice Doodle controls">
+        <section class="mode-switcher" aria-label="Visualization mode">
         <button class="mode-button is-active" type="button" data-mode="linear" aria-label="Score mode">
-          <span aria-hidden="true">S</span>
+          <span aria-hidden="true">Score</span>
         </button>
         <button class="mode-button" type="button" data-mode="vinyl" aria-label="Vinyl mode">
-          <span aria-hidden="true">V</span>
+          <span aria-hidden="true">Vinyl</span>
         </button>
         <button class="mode-button" type="button" data-mode="free" aria-label="Paint mode">
-          <span aria-hidden="true">P</span>
+          <span aria-hidden="true">Paint</span>
         </button>
+        </section>
+        <div class="top-actions">
+          <button id="saveButton" class="icon-button" type="button" aria-label="Save soundprint">
+            <span aria-hidden="true">save</span>
+          </button>
+          <button id="galleryButton" class="icon-button" type="button" aria-label="Open gallery">
+            <span aria-hidden="true">grid</span>
+          </button>
+          <button id="gyroButton" class="icon-button permission-button" type="button" aria-label="Enable motion">
+            <span aria-hidden="true">tilt</span>
+          </button>
+        </div>
+        <p id="modeLabel" class="sr-only">Score</p>
+        <p id="statusText" class="sr-only">Ready</p>
       </section>
 
       <section class="bottom-controls" aria-label="Controls">
         <button id="recordButton" class="main-action record" type="button" aria-label="Record">
-          <span class="record-dot" aria-hidden="true"></span>
+          <span aria-hidden="true">rec</span>
+        </button>
+        <button id="newBrushButton" class="main-action brush-record" type="button" aria-label="Record with new brush">
+          <span aria-hidden="true">brush rec</span>
         </button>
         <button id="playButton" class="main-action" type="button" aria-label="Play">
           <span aria-hidden="true">play</span>
         </button>
-        <button id="newBrushButton" class="main-action" type="button" aria-label="New brush">
-          <span aria-hidden="true">brush</span>
-        </button>
-        <button id="newRecordingButton" class="main-action" type="button" aria-label="New recording">
-          <span aria-hidden="true">new</span>
-        </button>
-        <button id="saveButton" class="main-action" type="button" aria-label="Save soundprint">
-          <span aria-hidden="true">save</span>
-        </button>
-        <button id="galleryButton" class="main-action" type="button" aria-label="Open gallery">
-          <span aria-hidden="true">grid</span>
-        </button>
         <button id="clearButton" class="main-action" type="button" aria-label="Clear">
           <span aria-hidden="true">clear</span>
         </button>
+        <label class="volume-control" aria-label="Playback volume">
+          <span>vol</span>
+          <input id="volumeSlider" type="range" min="0" max="2" step="0.01" value="1.35">
+        </label>
       </section>
-
-      <label class="volume-control" aria-label="Playback volume">
-        <span>vol</span>
-        <input id="volumeSlider" type="range" min="0" max="2" step="0.01" value="1.35">
-      </label>
 
       <div id="toast" class="toast" role="status" aria-live="polite"></div>
     </main>

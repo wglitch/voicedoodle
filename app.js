@@ -28,7 +28,6 @@
   const recordButton = document.querySelector("#recordButton");
   const playButton = document.querySelector("#playButton");
   const newBrushButton = document.querySelector("#newBrushButton");
-  const newRecordingButton = document.querySelector("#newRecordingButton");
   const clearButton = document.querySelector("#clearButton");
   const saveButton = document.querySelector("#saveButton");
   const galleryButton = document.querySelector("#galleryButton");
@@ -56,6 +55,7 @@
     micStream: null,
     sampleBuffer: new Float32Array(FFT_SIZE),
     isRecording: false,
+    recordingKind: "record",
     isPlaying: false,
     recordingStartedAt: 0,
     layers: [[]],
@@ -276,7 +276,7 @@
     if (!state.lastPitch) return pitch;
     const jump = Math.abs(pitch - state.lastPitch);
     const trust = clamp(clarity, 0.18, 0.82);
-    const blend = jump > 170 ? 0.16 : map(trust, 0.18, 0.82, 0.28, 0.62);
+    const blend = jump > 170 ? 0.1 : map(trust, 0.18, 0.82, 0.18, 0.44);
     return state.lastPitch * (1 - blend) + pitch * blend;
   }
 
@@ -340,35 +340,45 @@
     requestAnimationFrame(captureLoop);
   }
 
-  async function toggleRecording() {
+  async function toggleRecording(kind = "record") {
     if (state.isRecording) {
-      state.isRecording = false;
-      document.body.classList.remove("is-recording");
-      setStatus(`${currentLayer().length} points recorded`);
+      stopRecording();
       return;
     }
 
     try {
       await ensureAudio();
       stopPlayback();
+      if (kind === "brush") {
+        state.layers.push([]);
+        state.activeLayer = state.layers.length - 1;
+      }
       state.recordingStartedAt = performance.now();
       state.lastPitch = 0;
       state.isRecording = true;
+      state.recordingKind = kind;
       document.body.classList.add("is-recording");
-      setStatus(`Recording brush ${state.activeLayer + 1}`);
+      document.body.classList.toggle("is-brush-recording", kind === "brush");
+      setStatus(kind === "brush" ? `Recording brush ${state.activeLayer + 1}` : "Recording");
     } catch (error) {
       setStatus("Microphone denied");
       showToast(error.message);
     }
   }
 
+  function stopRecording() {
+    state.isRecording = false;
+    document.body.classList.remove("is-recording", "is-brush-recording");
+    setStatus(`${currentLayer().length} points recorded`);
+  }
+
   async function playSoundprint() {
     if (!hasSoundprint() || state.isPlaying) return;
     await ensureAudioForPlayback();
-    state.isRecording = false;
-    document.body.classList.remove("is-recording");
+    if (state.isRecording) stopRecording();
     state.isPlaying = true;
     state.playbackAudioStartedAt = scheduleContinuousSynth(state.layers);
+    document.body.classList.add("is-playing");
     state.playbackFrame = requestAnimationFrame(drawPlayback);
     setStatus("Playing");
   }
@@ -376,7 +386,7 @@
   function newRecording() {
     stopPlayback();
     state.isRecording = false;
-    document.body.classList.remove("is-recording");
+    document.body.classList.remove("is-recording", "is-brush-recording");
     state.layers = [[]];
     state.activeLayer = 0;
     state.livePoint = null;
@@ -388,15 +398,7 @@
   }
 
   function newBrush() {
-    stopPlayback();
-    state.isRecording = false;
-    document.body.classList.remove("is-recording");
-    state.layers.push([]);
-    state.activeLayer = state.layers.length - 1;
-    state.recordingStartedAt = performance.now();
-    state.lastPitch = 0;
-    setStatus(`Brush ${state.activeLayer + 1} ready`);
-    showToast("New brush");
+    toggleRecording("brush");
   }
 
   function scheduleContinuousSynth(layers) {
@@ -416,8 +418,8 @@
     const delayGain = audio.createGain();
 
     master.gain.setValueAtTime(state.playbackVolume, start);
-    delay.delayTime.setValueAtTime(0.16, start);
-    delayGain.gain.setValueAtTime(0.18, start);
+    delay.delayTime.setValueAtTime(0.075, start);
+    delayGain.gain.setValueAtTime(0.055, start);
     master.connect(audio.destination);
     master.connect(delay);
     delay.connect(delayGain);
@@ -425,7 +427,7 @@
     state.playbackNodes = [master, delay, delayGain];
 
     const activeLayers = layers
-      .map((layer) => layer.filter((point) => point.active !== false && point.pitch > 0))
+      .map((layer) => layer.filter((point) => point.pitch > 0 || point.active === false))
       .filter((layer) => layer.length > 0);
     if (!activeLayers.length) return start;
 
@@ -433,20 +435,26 @@
       const osc = audio.createOscillator();
       const gain = audio.createGain();
       const filter = audio.createBiquadFilter();
+      let synthPitch = clamp(usable.find((point) => point.active !== false)?.pitch || usable[0].pitch, MIN_PITCH, MAX_PITCH);
       osc.type = layerIndex % 2 ? "triangle" : "sine";
       filter.type = "lowpass";
       gain.gain.setValueAtTime(0.0001, start);
       filter.frequency.setValueAtTime(2200, start);
-      osc.frequency.setValueAtTime(clamp(usable[0].pitch, MIN_PITCH, MAX_PITCH), start);
+      osc.frequency.setValueAtTime(synthPitch, start);
 
       usable.forEach((point, index) => {
         if (index % 2 !== 0 && usable.length > 120) return;
         const when = start + point.time / 1000;
-        const pitch = clamp(point.pitch, MIN_PITCH, MAX_PITCH);
-        const amp = clamp(point.volume * 4.7, 0.0001, 0.48) / Math.sqrt(activeLayers.length);
+        const isActive = point.active !== false && point.pitch > 0 && point.volume > SILENCE_RMS;
+        const rawPitch = clamp(point.pitch || synthPitch, MIN_PITCH, MAX_PITCH);
+        const glide = Math.abs(rawPitch - synthPitch) > 140 ? 0.12 : 0.24;
+        synthPitch = synthPitch * (1 - glide) + rawPitch * glide;
+        const amp = isActive ? clamp(point.volume * 4.7, 0.0001, 0.48) / Math.sqrt(activeLayers.length) : 0.0001;
         const cutoff = 1200 + point.brightness * 3600 + point.clarity * 1800;
-        osc.frequency.linearRampToValueAtTime(pitch, when);
-        gain.gain.linearRampToValueAtTime(amp, when);
+        if (isActive) {
+          osc.frequency.linearRampToValueAtTime(synthPitch, when);
+        }
+        gain.gain.setTargetAtTime(amp, when, isActive ? 0.028 : 0.018);
         filter.frequency.linearRampToValueAtTime(cutoff, when);
       });
 
@@ -475,6 +483,7 @@
       }
     });
     state.playbackNodes = [];
+    document.body.classList.remove("is-playing");
   }
 
   function drawPlayback(now) {
@@ -531,35 +540,35 @@
 
   function drawLinen(width, height) {
     const gradient = ctx.createLinearGradient(0, 0, width, height);
-    gradient.addColorStop(0, "#e7d9bf");
-    gradient.addColorStop(0.5, "#cfbd9e");
-    gradient.addColorStop(1, "#ad9673");
+    gradient.addColorStop(0, "#eee3cf");
+    gradient.addColorStop(0.52, "#d8c9ae");
+    gradient.addColorStop(1, "#c1ad8d");
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, width, height);
 
-    ctx.globalAlpha = 0.14;
-    ctx.strokeStyle = "#fff7df";
+    ctx.globalAlpha = 0.16;
     ctx.lineWidth = 1;
-    for (let x = 0; x < width; x += 8) {
+    for (let x = 0; x < width; x += 5) {
+      ctx.strokeStyle = x % 10 === 0 ? "#f8f0dd" : "#b8a383";
       ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x + Math.sin(x) * 1.5, height);
+      ctx.moveTo(x + Math.sin(x * 0.09) * 1.6, 0);
+      ctx.lineTo(x + Math.sin(x * 0.17) * 2.2, height);
       ctx.stroke();
     }
-    ctx.strokeStyle = "#5b452d";
-    for (let y = 0; y < height; y += 9) {
+    for (let y = 0; y < height; y += 6) {
+      ctx.strokeStyle = y % 12 === 0 ? "#fff4df" : "#a99678";
       ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(width, y + Math.cos(y) * 1.5);
+      ctx.moveTo(0, y + Math.cos(y * 0.11) * 1.4);
+      ctx.lineTo(width, y + Math.cos(y * 0.16) * 2);
       ctx.stroke();
     }
-    ctx.globalAlpha = 0.08;
+    ctx.globalAlpha = 0.09;
     for (let i = 0; i < 34; i += 1) {
       const x = seededNoise(i * 31.73) * width;
       const y = seededNoise(i * 17.19) * height;
       const r = 34 + seededNoise(i * 8.37) * 86;
       const bump = ctx.createRadialGradient(x, y, 0, x, y, r);
-      bump.addColorStop(0, i % 2 ? "#fff8df" : "#695237");
+      bump.addColorStop(0, i % 2 ? "#fff8e7" : "#8c785f");
       bump.addColorStop(1, "rgba(255, 255, 255, 0)");
       ctx.fillStyle = bump;
       ctx.beginPath();
@@ -918,6 +927,8 @@
 
   function clearSoundprint() {
     stopPlayback();
+    state.isRecording = false;
+    document.body.classList.remove("is-recording", "is-brush-recording");
     state.layers = [[]];
     state.activeLayer = 0;
     state.livePoint = null;
@@ -926,6 +937,8 @@
   }
 
   function switchMode(mode) {
+    if (state.isRecording) stopRecording();
+    if (state.isPlaying) stopPlayback();
     state.mode = mode;
     document.body.dataset.mode = mode;
     modeLabel.textContent = modes[mode];
@@ -1075,7 +1088,7 @@
   function updateButtonStates() {
     playButton.disabled = !hasSoundprint() || state.isPlaying;
     saveButton.disabled = !hasSoundprint();
-    newBrushButton.disabled = state.isPlaying || state.isRecording;
+    newBrushButton.disabled = state.isPlaying;
     requestAnimationFrame(updateButtonStates);
   }
 
@@ -1086,10 +1099,9 @@
     }
   }
 
-  recordButton.addEventListener("click", toggleRecording);
+  recordButton.addEventListener("click", () => toggleRecording("record"));
   playButton.addEventListener("click", playSoundprint);
   newBrushButton.addEventListener("click", newBrush);
-  newRecordingButton.addEventListener("click", newRecording);
   clearButton.addEventListener("click", clearSoundprint);
   saveButton.addEventListener("click", saveCurrent);
   galleryButton.addEventListener("click", openGallery);
