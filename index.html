@@ -41,6 +41,12 @@
         <button id="playButton" class="main-action" type="button" aria-label="Play">
           <span aria-hidden="true">play</span>
         </button>
+        <button id="newBrushButton" class="main-action" type="button" aria-label="New brush">
+          <span aria-hidden="true">brush</span>
+        </button>
+        <button id="newRecordingButton" class="main-action" type="button" aria-label="New recording">
+          <span aria-hidden="true">new</span>
+        </button>
         <button id="saveButton" class="main-action" type="button" aria-label="Save soundprint">
           <span aria-hidden="true">save</span>
         </button>
@@ -51,6 +57,11 @@
           <span aria-hidden="true">clear</span>
         </button>
       </section>
+
+      <label class="volume-control" aria-label="Playback volume">
+        <span>vol</span>
+        <input id="volumeSlider" type="range" min="0" max="2" step="0.01" value="1.35">
+      </label>
 
       <div id="toast" class="toast" role="status" aria-live="polite"></div>
     </main>
