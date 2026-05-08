@@ -373,7 +373,13 @@
   }
 
   async function playSoundprint() {
-    if (!hasSoundprint() || state.isPlaying) return;
+    if (state.isPlaying) {
+      stopPlayback();
+      setStatus("Playback stopped");
+      drawScene(performance.now());
+      return;
+    }
+    if (!hasSoundprint()) return;
     await ensureAudioForPlayback();
     if (state.isRecording) stopRecording();
     state.isPlaying = true;
@@ -540,35 +546,48 @@
 
   function drawLinen(width, height) {
     const gradient = ctx.createLinearGradient(0, 0, width, height);
-    gradient.addColorStop(0, "#eee3cf");
-    gradient.addColorStop(0.52, "#d8c9ae");
-    gradient.addColorStop(1, "#c1ad8d");
+    gradient.addColorStop(0, "#f1efe3");
+    gradient.addColorStop(0.5, "#e6e0cf");
+    gradient.addColorStop(1, "#d8cfba");
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, width, height);
 
-    ctx.globalAlpha = 0.16;
-    ctx.lineWidth = 1;
-    for (let x = 0; x < width; x += 5) {
-      ctx.strokeStyle = x % 10 === 0 ? "#f8f0dd" : "#b8a383";
+    ctx.globalAlpha = 0.24;
+    ctx.lineWidth = 0.75;
+    for (let x = 0; x < width; x += 3) {
+      ctx.strokeStyle = x % 9 === 0 ? "#fbf9ec" : "#b9b19c";
       ctx.beginPath();
-      ctx.moveTo(x + Math.sin(x * 0.09) * 1.6, 0);
-      ctx.lineTo(x + Math.sin(x * 0.17) * 2.2, height);
+      ctx.moveTo(x + Math.sin(x * 0.13) * 0.9, 0);
+      ctx.lineTo(x + Math.sin(x * 0.21) * 1.2, height);
       ctx.stroke();
     }
-    for (let y = 0; y < height; y += 6) {
-      ctx.strokeStyle = y % 12 === 0 ? "#fff4df" : "#a99678";
+    ctx.globalAlpha = 0.2;
+    for (let y = 0; y < height; y += 4) {
+      ctx.strokeStyle = y % 12 === 0 ? "#fffdf0" : "#ada58f";
       ctx.beginPath();
-      ctx.moveTo(0, y + Math.cos(y * 0.11) * 1.4);
-      ctx.lineTo(width, y + Math.cos(y * 0.16) * 2);
+      ctx.moveTo(0, y + Math.cos(y * 0.15) * 0.9);
+      ctx.lineTo(width, y + Math.cos(y * 0.19) * 1.1);
       ctx.stroke();
     }
-    ctx.globalAlpha = 0.09;
-    for (let i = 0; i < 34; i += 1) {
+    ctx.globalAlpha = 0.12;
+    ctx.lineWidth = 0.5;
+    for (let i = 0; i < 180; i += 1) {
+      const x = seededNoise(i * 21.11) * width;
+      const y = seededNoise(i * 43.37) * height;
+      const len = 3 + seededNoise(i * 5.91) * 13;
+      ctx.strokeStyle = i % 3 === 0 ? "#8f896f" : "#fffdf2";
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + len, y + Math.sin(i) * 1.4);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 0.055;
+    for (let i = 0; i < 42; i += 1) {
       const x = seededNoise(i * 31.73) * width;
       const y = seededNoise(i * 17.19) * height;
-      const r = 34 + seededNoise(i * 8.37) * 86;
+      const r = 28 + seededNoise(i * 8.37) * 74;
       const bump = ctx.createRadialGradient(x, y, 0, x, y, r);
-      bump.addColorStop(0, i % 2 ? "#fff8e7" : "#8c785f");
+      bump.addColorStop(0, i % 2 ? "#fffef5" : "#8d866d");
       bump.addColorStop(1, "rgba(255, 255, 255, 0)");
       ctx.fillStyle = bump;
       ctx.beginPath();
